@@ -753,7 +753,7 @@ def main() -> None:
         with logfile.open("a", encoding="utf-8") as f:
             print(msg, file=f)
 
-    code = [f'{code_file}\n{Path(code_file).read_text(encoding="utf-8")}\n{"="*20}' for code_file in args.code_files].join("\n")
+    code = f'{"="*20}\n'.join(f'{code_file}\n{Path(code_file).read_text(encoding="utf-8")}\n' for code_file in args.code_files)
     log(code, console=False)
     log("=" * 100, console=False)
     log(f"Running Python {sys.version}", console=False)

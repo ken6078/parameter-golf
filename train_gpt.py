@@ -605,7 +605,7 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     args = Hyperparameters()
-    code = [f'{code_file}\n{Path(code_file).read_text(encoding="utf-8")}\n{"="*20}' for code_file in args.code_files].join("\n")
+    code = f'{"="*20}\n'.join(f'{code_file}\n{Path(code_file).read_text(encoding="utf-8")}\n' for code_file in args.code_files)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -639,7 +639,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp('1070' in ''.join(torch.cuda.get_device_name(device)).lower())
 
     logfile = None
     if master_process:
