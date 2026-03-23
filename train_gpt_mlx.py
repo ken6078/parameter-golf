@@ -7,10 +7,10 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import glob
+import io
 import json
 import math
 import os
-import pickle
 import sys
 import time
 import uuid
@@ -25,6 +25,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
+import torch
+from compress_gpt import compress_state_dict_pocketllm, decompress_state_dict_pocketllm
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -103,7 +105,7 @@ class Hyperparameters:
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     # Files need calculate
-    code_files = os.environ.get("CODE_FILE", "./train_gpt_mlx.py").split(";")
+    code_files = os.environ.get("CODE_FILE", "./train_gpt_mlx.py;./compress_gpt.py").split(";")
 
     @property
     def train_files(self) -> str:
@@ -134,14 +136,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
         "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
     ).split(",")
     if pattern
 )
@@ -548,130 +542,31 @@ class SplitOptimizers:
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# POCKET COMPRESS BRIDGE (MLX <-> TORCH)
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
-# - exact passthrough for non-floats
 
-MX_DTYPE_FROM_NAME = {
-    "float32": mx.float32,
-    "float16": mx.float16,
-    "bfloat16": mx.bfloat16,
-}
-
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
-INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
-
-def _np_float32(arr: mx.array) -> np.ndarray:
-    return np.array(arr.astype(mx.float32), dtype=np.float32, copy=False)
-
-
-def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str, str]) -> np.ndarray:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return np.ascontiguousarray(_np_float32(arr))
-    if arr.dtype in {mx.float32, mx.bfloat16}:
-        passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
-        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
-    return np.ascontiguousarray(np.array(arr, copy=True))
-
-
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
-    f32 = _np_float32(arr)
-    if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
-        clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
-        scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
-    scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
-    return np.ascontiguousarray(q), scale
-
-
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
-    quantized: dict[str, np.ndarray] = {}
-    scales: dict[str, np.ndarray] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, np.ndarray] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
+def mx_to_torch_state_dict(flat_state: dict[str, mx.array]) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
     for name, arr in flat_state.items():
-        stats["param_count"] += int(arr.size)
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += int(arr.nbytes)
-        if not mx.issubdtype(arr.dtype, mx.floating):
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = np.ascontiguousarray(np.array(arr))
-            stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
+        if arr.dtype == mx.bfloat16:
+            np_arr = np.array(arr.astype(mx.float32), dtype=np.float32, copy=False)
+            out[name] = torch.from_numpy(np_arr).to(dtype=torch.bfloat16).contiguous()
             continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_array(name, arr, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += int(kept.nbytes)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(arr.dtype).split(".")[-1]
-        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
+        np_arr = np.array(arr, copy=False)
+        if not np_arr.flags.c_contiguous:
+            np_arr = np.ascontiguousarray(np_arr)
+        out[name] = torch.from_numpy(np_arr).contiguous()
+    return out
 
 
-def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
+def torch_to_mx_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, mx.array]:
     out: dict[str, mx.array] = {}
-    qmeta = quant_obj.get("qmeta", {})
-    passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
-    for name, q in quant_obj["quantized"].items():
-        q_np = np.asarray(q, dtype=np.int8)
-        dtype_name = quant_obj["dtypes"][name]
-        scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
-        if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
-            out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu")
+        if t.dtype == torch.bfloat16:
+            out[name] = mx.array(t.to(dtype=torch.float32).numpy(), dtype=mx.bfloat16)
         else:
-            out_arr = q_np.astype(np.float32) * float(scale)
-        out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
-    for name, arr in quant_obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_arr = np.array(arr, copy=True)
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[orig_dtype])
-        else:
-            out[name] = mx.array(out_arr)
+            out[name] = mx.array(t.numpy())
     return out
 
 
@@ -1066,33 +961,36 @@ def main() -> None:
             stop_after_step = step
 
     # ==============================================================================
-    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
+    # FINAL SERIALIZATION + COMPRESSED ROUNDTRIP EVAL
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
+    # We always write a raw artifact and a compressed artifact, then validate the
+    # compressed roundtrip directly by loading the reconstructed tensors back into the
     # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
-    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+    torch_state = mx_to_torch_state_dict(flat_state)
+    quant_obj, quant_stats = compress_state_dict_pocketllm(torch_state)
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
-    quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+    quant_path = out_dir / f"{args.run_id}_mlx_model.compress.ptz"
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
     ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
     log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        f"serialized_model_pocket_zlib:{quant_file_bytes} bytes "
+        f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{len(quant_raw)} payload_ratio:{ratio:.2f}x)"
     )
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_flat = torch_to_mx_state_dict(decompress_state_dict_pocketllm(quant_state))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1105,8 +1003,8 @@ def main() -> None:
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(f"final_pocket_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(f"final_pocket_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
