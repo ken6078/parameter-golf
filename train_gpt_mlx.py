@@ -7,10 +7,10 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import glob
-import io
 import json
 import math
 import os
+import pickle
 import sys
 import time
 import uuid
@@ -25,8 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
-import torch
-from compress_gpt import compress_state_dict_pocketllm, decompress_state_dict_pocketllm
+from compress_gpt_mlx import compress_state_dict_pocketllm, decompress_state_dict_pocketllm
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -106,7 +105,7 @@ class Hyperparameters:
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     # Files need calculate
-    code_files = os.environ.get("CODE_FILE", "./train_gpt_mlx.py;./compress_gpt.py").split(";")
+    code_files = os.environ.get("CODE_FILE", "./train_gpt_mlx.py;./compress_gpt_mlx.py").split(";")
 
     @property
     def train_files(self) -> str:
@@ -542,35 +541,6 @@ class SplitOptimizers:
 
         model.update(tree_unflatten(list(updated.items())))
 
-# ==============================================================================
-# POCKET COMPRESS BRIDGE (MLX <-> TORCH)
-# ==============================================================================
-
-def mx_to_torch_state_dict(flat_state: dict[str, mx.array]) -> dict[str, torch.Tensor]:
-    out: dict[str, torch.Tensor] = {}
-    for name, arr in flat_state.items():
-        if arr.dtype == mx.bfloat16:
-            np_arr = np.array(arr.astype(mx.float32), dtype=np.float32, copy=False)
-            out[name] = torch.from_numpy(np_arr).to(dtype=torch.bfloat16).contiguous()
-            continue
-        np_arr = np.array(arr, copy=False)
-        if not np_arr.flags.c_contiguous:
-            np_arr = np.ascontiguousarray(np_arr)
-        out[name] = torch.from_numpy(np_arr).contiguous()
-    return out
-
-
-def torch_to_mx_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, mx.array]:
-    out: dict[str, mx.array] = {}
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu")
-        if t.dtype == torch.bfloat16:
-            out[name] = mx.array(t.to(dtype=torch.float32).numpy(), dtype=mx.bfloat16)
-        else:
-            out[name] = mx.array(t.numpy())
-    return out
-
-
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -981,11 +951,8 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    torch_state = mx_to_torch_state_dict(flat_state)
-    quant_obj, quant_stats = compress_state_dict_pocketllm(torch_state)
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
+    quant_obj, quant_stats = compress_state_dict_pocketllm(flat_state)
+    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_path = out_dir / f"{args.run_id}_mlx_model.compress.ptz"
     with quant_path.open("wb") as f:
@@ -994,13 +961,13 @@ def main() -> None:
     ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
     log(
         f"serialized_model_pocket_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{len(quant_raw)} payload_ratio:{ratio:.2f}x)"
+        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{len(quant_raw)} payload_ratio:{ratio:.2f}x)"
     )
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    quant_flat = torch_to_mx_state_dict(decompress_state_dict_pocketllm(quant_state))
+    quant_state = pickle.loads(zlib.decompress(quant_blob_disk))
+    quant_flat = decompress_state_dict_pocketllm(quant_state)
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
