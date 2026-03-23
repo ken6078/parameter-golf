@@ -37,6 +37,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
+    try:
+        import dotenv
+        dotenv.load_dotenv()
+    except ImportError:
+        print("python-dotenv not found, skipping .env loading")
+    
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -85,6 +91,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # File need calculate
+    code_files = os.environ.get("CODE_FILE", "./train_gpt.py").split(";")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -731,8 +740,8 @@ class GPT(nn.Module):
 def main() -> None:
     global zeropower_via_newtonschulz5
 
-    code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    code = [f'{code_file}\n{Path(code_file).read_text(encoding="utf-8")}\n{"="*20}' for code_file in args.code_files].join("\n")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
