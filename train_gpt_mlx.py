@@ -58,8 +58,9 @@ class Hyperparameters:
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation always uses the full fineweb_val split.
+    # Validation cadence/batch size and optional val subset ratio.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_data_ratio: float = float(os.environ.get("VAL_DATA_RATIO", 1.0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -630,16 +631,22 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: int, val_data_ratio: float = 1.0) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    if not (0.0 < val_data_ratio <= 1.0):
+        raise ValueError(f"VAL_DATA_RATIO must be in (0, 1], got {val_data_ratio}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    # We optionally evaluate only a prefix subset controlled by VAL_DATA_RATIO.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
     usable = ((tokens.size - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return tokens[: usable + 1]
+    usable_seqs = usable // seq_len
+    selected_seqs = max(1, int(usable_seqs * val_data_ratio))
+    selected_usable = selected_seqs * seq_len
+    return tokens[: selected_usable + 1]
 
 
 def loss_and_grad_chunked(
@@ -773,7 +780,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_data_ratio)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -823,7 +830,10 @@ def main() -> None:
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
-    log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
+    log(
+        f"val_loader:shards pattern={args.val_files} "
+        f"tokens:{val_tokens.size - 1} val_data_ratio:{args.val_data_ratio:g}"
+    )
     if expected_train_files is None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     elif actual_train_files < expected_train_files:

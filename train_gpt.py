@@ -52,9 +52,10 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
+    # Validation cadence/batch size and optional val subset ratio.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_data_ratio = float(os.environ.get("VAL_DATA_RATIO", 1.0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -214,16 +215,22 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, val_data_ratio: float = 1.0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    if not (0.0 < val_data_ratio <= 1.0):
+        raise ValueError(f"VAL_DATA_RATIO must be in (0, 1], got {val_data_ratio}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    # We optionally evaluate only a prefix subset controlled by VAL_DATA_RATIO.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return tokens[: usable + 1]
+    usable_seqs = usable // seq_len
+    selected_seqs = max(1, int(usable_seqs * val_data_ratio))
+    selected_usable = selected_seqs * seq_len
+    return tokens[: selected_usable + 1]
 
 
 def eval_val(
@@ -684,13 +691,16 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_data_ratio)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} "
+        f"tokens:{val_tokens.numel() - 1} val_data_ratio:{args.val_data_ratio:g}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
