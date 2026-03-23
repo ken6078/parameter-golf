@@ -255,6 +255,10 @@ class PocketMLP(nn.Module):
             return F.layer_norm(x, (x.shape[-1],))
         if self.norm_type == "rln":
             assert self.rln is not None
+            # RLN relies on original subvector partitioning. For hidden widths that do not
+            # match subvector_dim, fall back to per-vector LN to keep shapes valid.
+            if x.shape[-1] != meta.subv_dim:
+                return F.layer_norm(x, (x.shape[-1],))
             return self.rln(x, meta)
         raise ValueError(f"Unsupported norm_type={self.norm_type}")
 
@@ -318,6 +322,8 @@ class PocketLayerCompressor:
         w = weight_2d.detach().to(self.device, dtype=torch.float32).contiguous()
         s, meta = split_weight_matrix(w, self.cfg.subvector_dim)
         latent_dim = self.cfg.latent_dim
+        n_subvectors = int(s.shape[0])
+        effective_k = min(self.cfg.codebook_size, max(16, n_subvectors))
 
         encoder = PocketMLP(
             in_dim=self.cfg.subvector_dim,
@@ -345,7 +351,7 @@ class PocketLayerCompressor:
         ).to(self.device)
         quant = VectorQuantizerSTE(
             latent_dim=latent_dim,
-            codebook_size=self.cfg.codebook_size,
+            codebook_size=effective_k,
             init_mode=self.cfg.codebook_init,
             init_std=self.cfg.codebook_init_std,
         ).to(self.device)
@@ -354,6 +360,7 @@ class PocketLayerCompressor:
         optimizer = torch.optim.Adam(params, lr=self.cfg.lr)
 
         s_rows = s.reshape(meta.n_rows, meta.subv_per_row, meta.subv_dim).contiguous()
+        nn_chunk = max(256, min(8192, int(self.cfg.chunk_rows)))
 
         for _ in range(max(1, self.cfg.train_steps)):
             batch_rows = min(max(1, self.cfg.batch_rows), meta.n_rows)
@@ -371,7 +378,7 @@ class PocketLayerCompressor:
             )
 
             z = encoder(s_batch, batch_meta)
-            z_q_st, _, vq_mse_sum = quant(z, chunk=max(1, self.cfg.chunk_rows * meta.subv_per_row))
+            z_q_st, _, vq_mse_sum = quant(z, chunk=nn_chunk)
             s_hat = decoder(z_q_st, batch_meta)
 
             sq = (s_batch - s_hat).square()
@@ -389,7 +396,7 @@ class PocketLayerCompressor:
 
         with torch.no_grad():
             z_all = encoder(s, meta)
-            idx = VectorQuantizerSTE.nearest_indices(z_all, quant.codebook, chunk=max(1, self.cfg.chunk_rows * meta.subv_per_row))
+            idx = VectorQuantizerSTE.nearest_indices(z_all, quant.codebook, chunk=nn_chunk)
             z_q = quant.codebook[idx]
             s_hat = decoder(z_q, meta)
             w_hat_fp32 = merge_weight_matrix(s_hat, meta)
@@ -419,6 +426,7 @@ class PocketLayerCompressor:
                 "decoder_state": decoder_state,
                 "meta": asdict(meta),
                 "latent_dim": latent_dim,
+                "effective_codebook_size": effective_k,
                 "meta_hidden_dim": self.cfg.meta_hidden_dim,
                 "decoder_layers": self.cfg.decoder_layers,
                 "activation": self.cfg.activation,
@@ -478,7 +486,7 @@ class PocketLayerCompressor:
 
 class PocketModelCompressor:
     ATTN_NAME_HINTS = (
-        "q_proj", "k_proj", "v_proj", "o_proj", "wq", "wk", "wv", "wo", "qkv", "attn.q", "attn.k", "attn.v", "attn.o"
+        "q_proj", "k_proj", "v_proj", "o_proj", "wq", "wk", "wv", "wo", "qkv", "attn.q", "attn.k", "attn.v", "attn.o", "c_q", "c_k", "c_v"
     )
     FFN_NAME_HINTS = (
         "up_proj", "gate_proj", "down_proj", "mlp.up", "mlp.gate", "mlp.down", "fc", "proj", "ffn"
@@ -534,6 +542,7 @@ class PocketModelCompressor:
                 "param_count",
                 "num_tensors",
                 "num_compressed_tensors",
+                "num_compress_failures",
                 "num_nonfloat_tensors",
                 "baseline_tensor_bytes",
                 "int8_payload_bytes",
@@ -545,6 +554,7 @@ class PocketModelCompressor:
         )
 
         can_refresh = self._can_refresh_now(step)
+        failure_messages: list[str] = []
         for name, tensor in state_dict.items():
             t = tensor.detach().to("cpu").contiguous()
             stats["param_count"] += int(t.numel())
@@ -570,7 +580,10 @@ class PocketModelCompressor:
 
             try:
                 result = self.layer.compress(name=name, weight_2d=t, keep_original_dtype=t.dtype)
-            except Exception:
+            except Exception as ex:
+                stats["num_compress_failures"] += 1
+                if len(failure_messages) < 8:
+                    failure_messages.append(f"{name}: {type(ex).__name__}: {ex}")
                 kept = t.to(dtype=self.cfg.keep_float_store_dtype).contiguous()
                 passthrough[name] = kept
                 stats["int8_payload_bytes"] += tensor_nbytes(kept)
@@ -613,6 +626,8 @@ class PocketModelCompressor:
         }
         if passthrough_orig_dtypes:
             obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+        if failure_messages:
+            obj["compress_failures"] = failure_messages
         return obj, stats
 
     @staticmethod
@@ -716,12 +731,21 @@ def compress_state_dict_pocketllm(state_dict: dict[str, Tensor], step: int | Non
             f"[PocketLLM][layer] {name} rmse={m['rmse']:.6e} vq_mse_sum={m['vq_mse_sum']:.6e} "
             f"mse_top100={m['mse_top100']:.6e}"
         )
+    for msg in obj.get("compress_failures", []):
+        print(f"[PocketLLM][warn] compress_fallback {msg}")
     print(
         "[PocketLLM][bytes] codebook={cb} indices={idx} decoder={dec} total={tot}".format(
             cb=stats["codebook_bytes"],
             idx=stats["indices_bytes"],
             dec=stats["decoder_bytes"],
             tot=stats["int8_payload_bytes"],
+        )
+    )
+    print(
+        "[PocketLLM][counts] compressed={c} failures={f} total={t}".format(
+            c=stats["num_compressed_tensors"],
+            f=stats["num_compress_failures"],
+            t=stats["num_tensors"],
         )
     )
     return obj, stats
